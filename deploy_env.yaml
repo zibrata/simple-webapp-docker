@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+#   ----------------------------------------------------------
+#   Creation date
+#   March 2020
+#
+#   Author
+#   Alexandre Levret - WWPS ProServe Graduate Consultant EMEA
+#   ----------------------------------------------------------
+
+Description: >-
+  This templates aims to create the deployment environment that will host our Docker containers in Fargate mode
+
+Parameters:
+
+  EnvironmentName:
+    Description: An environment name that is prefixed to resource names
+    Type: String
+    Default: Fargate-Infrastructure
+
+  InfrastructureStack:
+    Type: String
+    Default: Infrastructure
+
+  ClusterName:
+    Type: String
+    Default: Pipeline-Cluster
+
+  ServiceName:
+    Type: String
+    Default: service-name
+
+  ImageURI:
+    Type: String
+
+  ContainerExposePort:
+    Description: TCP/IP Port expose by container
+    Type: Number
+    Default: 8080
+
+Resources:
+
+  ClusterECS:
+    Type: AWS::ECS::Cluster
+    DeletionPolicy: Delete
+    Properties:
+      ClusterName: !Ref ClusterName
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  TaskFargate:
+    Type: AWS::ECS::TaskDefinition
+    DeletionPolicy: Delete
+    Properties:
+      Family: !Ref ServiceName
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Environment:
+            - Name: VAR_1
+              Value: "false"
+            - Name: VAR2
+              Value: "exemple of var"
+          Name: !Ref ServiceName
+          Cpu: 512
+          Memory: 1024
+          Image: !Ref ImageURI
+          PortMappings:
+            - ContainerPort: !Ref ContainerExposePort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+                awslogs-group: !Sub '/ecs/${ClusterName}/${ServiceName}'
+                awslogs-region: !Ref AWS::Region
+                awslogs-stream-prefix: "dashboard"
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ClusterName}/${ServiceName}'
+  
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    DeletionPolicy: Delete
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref ClusterECS
+      LaunchType: FARGATE
+      DesiredCount: 2
+      DeploymentController: 
+        Type: ECS
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - Fn::ImportValue:
+                !Sub '${InfrastructureStack}-SG'
+            - !Ref ContainerSecurityGroup
+          Subnets:
+            - Fn::ImportValue: 
+                !Sub '${InfrastructureStack}-PublicSubnet1'
+            - Fn::ImportValue: 
+                !Sub '${InfrastructureStack}-PublicSubnet2'
+      TaskDefinition: !Ref TaskFargate
+      LoadBalancers:
+        - ContainerName: !Ref ServiceName
+          ContainerPort: !Ref ContainerExposePort
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  ECSRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    Properties:
+      RoleName: !Sub "ECSServiceRole-${AWS::AccountId}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 
+            - ecs.amazonaws.com
+          Action: 
+          - "sts:AssumeRole"
+      Path: /
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - 'ec2:AttachNetworkInterface'
+              - 'ec2:CreateNetworkInterface'
+              - 'ec2:CreateNetworkInterfacePermission'
+              - 'ec2:DeleteNetworkInterface'
+              - 'ec2:DeleteNetworkInterfacePermission'
+              - 'ec2:Describe*'
+              - 'ec2:DetachNetworkInterface'
+              - 'elasticloadbalancing:DeregisterInstancesFromLoadBalancer'
+              - 'elasticloadbalancing:DeregisterTargets'
+              - 'elasticloadbalancing:Describe*'
+              - 'elasticloadbalancing:RegisterInstancesWithLoadBalancer'
+              - 'elasticloadbalancing:RegisterTargets'
+            Resource: '*'
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    Properties:
+      RoleName: !Sub "ECSTaskExecutionRole-${AWS::AccountId}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 
+            - ecs-tasks.amazonaws.com
+          Action: 
+          - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+                - 's3:*'
+              Resource: '*'
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['-', [api, ContainerSecurityGroup]]
+      VpcId:  {'Fn::ImportValue':  !Sub '${InfrastructureStack}-VpcId'}
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerExposePort
+          ToPort:  !Ref ContainerExposePort
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['-', [api, LoadBalancerSecurityGroup]]
+      VpcId:  {'Fn::ImportValue':  !Sub '${InfrastructureStack}-VpcId'}
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DeletionPolicy: Delete
+    Properties:
+      Name: !Ref EnvironmentName
+      Subnets: 
+        - Fn::ImportValue: 
+            !Sub '${InfrastructureStack}-PublicSubnet1'
+        - Fn::ImportValue: 
+            !Sub '${InfrastructureStack}-PublicSubnet2'
+      SecurityGroups:
+        - Fn::ImportValue:
+            !Sub '${InfrastructureStack}-SG'
+        - !Ref LoadBalancerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+  
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DeletionPolicy: Delete
+    Properties:
+      Name: !Sub ${EnvironmentName}-default
+      VpcId: 
+        Fn::ImportValue:
+          !Sub '${InfrastructureStack}-VpcId'
+      HealthCheckPath: /health-check
+      HealthCheckProtocol: HTTP
+      Port: !Ref ContainerExposePort
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60 # default is 300
+      TargetType: ip
+      HealthCheckIntervalSeconds: 10
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DeletionPolicy: Delete
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+Outputs:
+  DNS:
+    Description: Application Load Balancer's DNS to access to ECS tasks behind
+    Value: !Sub 'http://${ALB.DNSName}'
